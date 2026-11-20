@@ -1,83 +1,282 @@
+"""Streamlit frontend for PDF Smart Subject Tutor."""
+
+from __future__ import annotations
+
+import time
 import streamlit as st
-from rag_engine import OpenSourceRAGTutor, STYLE_PROMPTS
+from dotenv import load_dotenv
+from pdf_rag import PDFTutor
+
+load_dotenv()
 
 st.set_page_config(
-    page_title="Smart Subject Tutor v1.0 (Open-Source RAG)",
+    page_title="Smart Subject Tutor - PDF First",
     page_icon="🎓",
     layout="wide",
 )
 
+st.title("🎓 Smart Subject Tutor")
+st.caption("Upload PDFs. Ask questions. Get answers with page references.")
 
-@st.cache_resource(show_spinner="Loading Open-Source Embedding & LLM Models (Zero API Keys)...")
-def load_tutor_engine() -> OpenSourceRAGTutor:
-    return OpenSourceRAGTutor(notes_path="data/subject_notes.md")
+DEFAULT_MODELS = {
+    "Gemini": "gemini-3.8-flash",
+    "OpenAI": "gpt-6-luna",
+    "Claude": "claude-haiku-5-5",
+}
 
+KEY_NAMES = {
+    "Gemini": "GEMINI_API_KEY",
+    "OpenAI": "OPENAI_API_KEY",
+    "Claude": "ANTHROPIC_API_KEY",
+}
 
-tutor = load_tutor_engine()
+# Initialize tutor
+if "tutor" not in st.session_state:
+    with st.spinner("Loading PDF search model..."):
+        st.session_state.tutor = PDFTutor()
 
-# =====================================================================
-# SIDEBAR: SUBJECT TELEMETRY & STYLE SELECTOR
-# =====================================================================
+if "indexed" not in st.session_state:
+    st.session_state.indexed = False
+
+if "xp" not in st.session_state:
+    st.session_state.xp = 0
+
+if "api_calls" not in st.session_state:
+    st.session_state.api_calls = 0
+
+if "last_api_call" not in st.session_state:
+    st.session_state.last_api_call = 0.0
+
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ Tutor Controls (v1.0)")
-    st.success("🔓 100% Open-Source Stack (No API Key)")
-    st.markdown(f"**Active Subject:** `{tutor.subject_title}`")
-    st.markdown(f"**Indexed Knowledge Chunks:** `{tutor.chunk_count}`")
 
-    selected_style = st.radio(
-        "🎨 Select Explanation Style:",
-        options=list(STYLE_PROMPTS.keys()),
-        index=0,
+    st.header("Learning Progress")
+    st.metric("Learning XP", st.session_state.xp)
+
+    if st.session_state.xp < 15:
+        learner_level = "Beginner"
+        st.info("Mode: Beginner")
+
+    elif st.session_state.xp < 40:
+        learner_level = "Intermediate"
+        st.info("Mode: Intermediate")
+
+    else:
+        learner_level = "Advanced"
+        st.success("Mode: Advanced")
+
+    st.divider()
+
+    st.header("App Safety Limits")
+
+    st.write(
+        f"API calls: {st.session_state.api_calls} / 25"
     )
 
-    top_k = st.slider("🔍 Top-K Retrieved Chunks:", min_value=1, max_value=3, value=2)
+    st.caption("5-second wait between API requests.")
 
-    if st.button("🔄 Reload data/subject_notes.md"):
-        st.cache_resource.clear()
-        st.rerun()
+# PDF Upload
+st.subheader("1. Upload Your Subject PDFs")
 
-# =====================================================================
-# MAIN INTERFACE
-# =====================================================================
-st.title("🎓 Smart Subject Tutor (v1.0)")
-st.caption(
-    f"Grounded in `data/subject_notes.md` ({tutor.subject_title}) • "
-    "Embeddings: `all-MiniLM-L6-v2` • LLM: `Qwen2.5-0.5B-Instruct` • Vector DB: `ChromaDB`"
+uploaded_pdfs = st.file_uploader(
+    "Choose PDF files",
+    type=["pdf"],
+    accept_multiple_files=True,
 )
 
-st.info(
-    f"**Current Persona Active:** `{selected_style}` — Ask the exact same question under "
-    "different styles to see how the tutor adapts its teaching voice while staying grounded in your notes!"
-)
+if uploaded_pdfs:
 
-default_question = "What is a Deadlock and what are the four conditions required for it?"
-user_query = st.text_input(
-    "Ask a question about your chosen subject:",
-    value=default_question,
-)
+    st.write("Selected files:")
 
-if st.button("🚀 Generate Style-Adapted Answer", type="primary"):
-    if not user_query.strip():
-        st.warning("Please enter a question first.")
-    else:
-        with st.spinner(f"Retrieving chunks & generating '{selected_style}' explanation..."):
-            answer, retrieved_chunks = tutor.generate_styled_answer(
-                query=user_query,
-                style_name=selected_style,
-                top_k=top_k,
+    for pdf_file in uploaded_pdfs:
+        size_mb = pdf_file.size / (1024 * 1024)
+
+        st.write(
+            f"- {pdf_file.name} ({size_mb:.1f} MB)"
+        )
+
+index_col, clear_col = st.columns(2)
+
+with index_col:
+
+    if st.button(
+        "Index Selected PDFs",
+        type="primary",
+        disabled=not uploaded_pdfs,
+    ):
+
+        too_large = [
+            f.name for f in uploaded_pdfs
+            if f.size > 25 * 1024 * 1024
+        ]
+
+        if too_large:
+            st.error(
+                "Each PDF must be 25 MB or smaller: "
+                + ", ".join(too_large)
             )
 
-        col1, col2 = st.columns([3, 2])
+        else:
+            with st.spinner("Reading PDFs and creating search index..."):
 
-        with col1:
-            st.subheader(f"💡 Tutor Response ({selected_style})")
+                try:
+                    stats = st.session_state.tutor.index_pdfs(
+                        uploaded_pdfs
+                    )
+
+                    st.session_state.indexed = True
+
+                    st.success(
+                        f"Indexed {len(stats['files'])} file(s), "
+                        f"{stats['pages_with_text']} pages and "
+                        f"{stats['chunks']} searchable passages."
+                    )
+
+                    if stats["files_without_text"]:
+                        st.warning(
+                            "No selectable text found in: "
+                            + ", ".join(stats["files_without_text"])
+                        )
+
+                except Exception as exc:
+                    st.session_state.indexed = False
+                    st.error(f"PDF indexing failed: {exc}")
+
+with clear_col:
+
+    if st.button("Clear Current PDF Index"):
+
+        try:
+            existing = st.session_state.tutor.collection.get()
+
+            if existing.get("ids"):
+                st.session_state.tutor.collection.delete(
+                    ids=existing["ids"]
+                )
+
+            st.session_state.tutor.indexed_files = []
+            st.session_state.tutor.indexed_pages = 0
+            st.session_state.indexed = False
+
+            st.success("PDF index cleared.")
+
+        except Exception as exc:
+            st.error(f"Could not clear index: {exc}")
+
+st.divider()
+
+# AI Provider
+st.subheader("2. Choose Your AI Provider")
+
+provider_col, model_col = st.columns([1, 2])
+
+with provider_col:
+
+    provider = st.selectbox(
+        "Select Provider",
+        ["Gemini", "OpenAI", "Claude"],
+    )
+
+with model_col:
+
+    model = st.text_input(
+        "Model ID",
+        value=DEFAULT_MODELS[provider],
+        key=f"model_{provider}",
+    )
+
+st.caption(
+    f"Required API key: {KEY_NAMES[provider]}"
+)
+
+st.divider()
+
+# Ask Question
+st.subheader("3. Ask Your Question")
+
+question = st.text_area(
+    "What would you like to learn?",
+    placeholder="Explain the four conditions required for deadlock.",
+    height=100,
+)
+
+cooldown = max(
+    0,
+    5 - (time.time() - st.session_state.last_api_call)
+)
+
+can_ask = (
+    st.session_state.indexed
+    and bool(question.strip())
+    and bool(model.strip())
+    and st.session_state.api_calls < 25
+    and cooldown <= 0
+)
+
+if st.button(
+    "🚀 Ask the Tutor",
+    type="primary",
+    disabled=not can_ask,
+):
+
+    st.session_state.api_calls += 1
+    st.session_state.last_api_call = time.time()
+
+    with st.spinner(f"Searching PDFs using {provider}..."):
+
+        try:
+            answer, sources = st.session_state.tutor.answer(
+                question=question.strip(),
+                provider=provider,
+                model=model.strip(),
+                learner_level=learner_level,
+                top_k=4,
+            )
+
+            st.session_state.xp += 5
+
+            st.markdown("### 💡 Tutor's Answer")
             st.markdown(answer)
 
-        with col2:
-            st.subheader("📚 Retrieved RAG Context & Cosine Similarity")
-            for idx, chunk in enumerate(retrieved_chunks, start=1):
-                with st.expander(
-                    f"Rank #{idx}: {chunk['topic']} (cos θ = {chunk['similarity']})",
-                    expanded=(idx == 1),
-                ):
-                    st.write(chunk["content"])
+            with st.expander("📚 View Retrieved PDF Passages"):
+
+                for idx, item in enumerate(sources, start=1):
+
+                    st.markdown(
+                        f"**{idx}. {item['source']} "
+                        f"- Page {item['page']}**"
+                    )
+
+                    st.write(item["text"])
+
+            st.caption("+5 XP for asking a question.")
+
+        except Exception as exc:
+
+            st.error(f"Request failed: {exc}")
+
+            st.info(
+                "Check your API key, model ID, API credits "
+                "and provider usage limits."
+            )
+
+elif not st.session_state.indexed:
+
+    st.info("Upload PDFs and click Index Selected PDFs first.")
+
+elif cooldown > 0:
+
+    st.warning(
+        f"Please wait {cooldown:.1f} seconds."
+    )
+
+elif st.session_state.api_calls >= 25:
+
+    st.warning("API request limit reached for this session.")
+
+st.divider()
+
+st.caption(
+    "Privacy: Retrieved PDF passages are sent to your selected "
+    "AI provider. Do not upload confidential documents without permission."
+)
